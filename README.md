@@ -4,4 +4,4 @@ VLESS on Cloudflare Workers.
 
 ## Deployment
 
-To deploay, Replace \<UUID> and \<domain> in wrangler.toml with your own values.
+To deploay, Replace \<domain>, \<UUID>, \<PROXY> in wrangler.toml with your own values.

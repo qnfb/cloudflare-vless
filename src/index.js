@@ -1,3 +1,4 @@
+// eslint-disable-next-line import/no-unresolved
 import { connect } from 'cloudflare:sockets';
 
 const base64toArrayBuffer = (base64) => {
@@ -68,8 +69,41 @@ const decodeRequestHeader = (header, uuid) => {
   };
 };
 
-const process = async (request, server, uuid) => {
-  const stream = new ReadableStream({
+const { log } = console;
+
+const tproxy = async ({
+  server, stream, version, socket,
+}) => {
+  stream.pipeTo(socket.writable);
+  let response;
+  await socket.readable.pipeTo(new WritableStream({
+    write: async (chunk) => {
+      if (!response) {
+        response = await new Blob([new Uint8Array([version, 0]), chunk]).arrayBuffer();
+      } else {
+        response = chunk;
+      }
+      server.send(response);
+    },
+  }));
+
+  socket.close();
+  socket.closed.catch(({ message }) => {
+    log(`outbound connection closed: ${message}`);
+  });
+
+  return response;
+};
+
+const process = (request, env) => {
+  log(`inbound connection from: ${request.headers.get('CF-connecting-IP')}`);
+
+  // eslint-disable-next-line no-undef
+  const [client, server] = new WebSocketPair();
+  server.accept();
+
+  // 0-RTT
+  const stream1 = new ReadableStream({
     start: (controller) => {
       const earlyData = request.headers.get('Sec-WebSocket-Protocol');
       if (earlyData) {
@@ -82,58 +116,61 @@ const process = async (request, server, uuid) => {
 
       server.addEventListener('close', (event) => {
         if (!event.wasClean) {
-          console.log(`connection closed: ${event.reason}`);
+          log(`inbound connection closed: ${event.reason}`);
         }
-        controller.close();
+        try {
+          controller.close();
+        } catch (e) {
+          log(e);
+        }
       });
     },
   });
 
+  // get rid of header
   const { promise, resolve, reject } = Promise.withResolvers();
   let version;
   let port;
   let address;
-  let socket;
-  stream.pipeTo(new WritableStream({
-    write: (chunk) => {
-      let byteOffset = 0;
-      if (!socket) {
-        try {
-          ({
-            version, port, address, byteOffset,
-          } = decodeRequestHeader(chunk, uuid));
-          console.log(`connection to ${address}:${port}`);
-          socket = connect({ hostname: address, port });
-        } catch (e) {
-          console.log(e);
-          reject();
-          return;
+  const stream2 = new ReadableStream({
+    start: async (controller) => {
+      try {
+        server.addEventListener('close', () => controller.close());
+        // eslint-disable-next-line no-restricted-syntax
+        for await (const chunk of stream1) {
+          let byteOffset = 0;
+          if (!port) {
+            ({
+              version, port, address, byteOffset,
+            } = decodeRequestHeader(chunk, env.UUID));
+            resolve();
+          }
+          controller.enqueue(chunk.slice(byteOffset));
         }
-      }
-      const writer = socket.writable.getWriter();
-      writer.write(chunk.slice(byteOffset));
-      writer.releaseLock();
-      resolve();
-    },
-    close: () => {
-      if (socket) {
-        socket.close();
+      } catch (e) {
+        reject(e);
       }
     },
-  }));
-  await promise;
+  });
+  const [teedOff1, teedOff2] = stream2.tee();
 
-  let response;
-  socket.readable.pipeTo(new WritableStream({
-    write: async (chunk) => {
-      if (!response) {
-        response = await new Blob([new Uint8Array([version, 0]), chunk]).arrayBuffer();
-      } else {
-        response = chunk;
-      }
-      server.send(response);
-    },
-  }));
+  promise.then(async () => {
+    log(`outbound connection to ${address}:${port}`);
+    const response = await tproxy({
+      server, stream: teedOff1, version, socket: connect({ hostname: address, port }),
+    });
+    if (response) return;
+
+    const [hostname, port1] = env.PROXY.split(':');
+    if (!hostname) return;
+    const port2 = port1 || 443;
+    log(`proxy connection to ${hostname}:${port2}`);
+    tproxy({
+      server, stream: teedOff2, version, socket: connect({ hostname, port: port2 }),
+    });
+  }).catch(log);
+
+  return new Response(null, { status: 101, webSocket: client });
 };
 
 export default {
@@ -142,10 +179,6 @@ export default {
     if (!upgradeHeader || upgradeHeader !== 'websocket') {
       return new Response(null, { status: 426 });
     }
-
-    const [client, server] = new WebSocketPair();
-    server.accept();
-    process(request, server, env.UUID);
-    return new Response(null, { status: 101, webSocket: client });
+    return process(request, env);
   },
 };
