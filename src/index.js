@@ -1,13 +1,33 @@
 // eslint-disable-next-line import/no-unresolved
 import { connect } from 'cloudflare:sockets';
 
+const { log } = console;
+
 const base64toArrayBuffer = (base64) => {
   if (!base64) return null;
   const basic = base64.replace(/-/g, '+').replace(/_/g, '/');
   return Uint8Array.from(atob(basic), (ch) => ch.charCodeAt(0)).buffer;
 };
 
-const decodeRequestHeader = (header, uuid) => {
+const decode0RTT = (request, server) => new ReadableStream({
+  start: (controller) => {
+    const earlyData = request.headers.get('Sec-WebSocket-Protocol');
+    if (earlyData) controller.enqueue(base64toArrayBuffer(earlyData));
+
+    server.addEventListener('message', (event) => {
+      controller.enqueue(event.data);
+    });
+
+    server.addEventListener('close', (event) => {
+      if (!event.wasClean) {
+        log(`inbound connection closed: ${event.reason}`);
+      }
+      controller.close();
+    });
+  },
+});
+
+const decodeVLESSHeader = (header, uuid) => {
   let byteOffset = 0;
 
   const [version] = new Uint8Array(header, byteOffset, 1);
@@ -40,14 +60,14 @@ const decodeRequestHeader = (header, uuid) => {
   byteOffset += 1;
 
   let addressLen;
-  let address;
+  let hostname;
   if (af === 1) { // IPv4
     addressLen = 4;
-    address = new Uint8Array(header, byteOffset, addressLen).join('.');
+    hostname = new Uint8Array(header, byteOffset, addressLen).join('.');
   } else if (af === 2) { // FQDN
     [addressLen] = new Uint8Array(header, byteOffset, 1);
     byteOffset += 1;
-    address = new TextDecoder().decode(header.slice(byteOffset, byteOffset + addressLen));
+    hostname = new TextDecoder().decode(header.slice(byteOffset, byteOffset + addressLen));
   } else if (af === 3) { // IPv6
     addressLen = 16;
     const view = new DataView(header.slice(byteOffset, byteOffset + addressLen));
@@ -55,7 +75,7 @@ const decodeRequestHeader = (header, uuid) => {
     for (let i = 0; i < 8; i += 1) {
       ipv6.push(view.getUint16(i * 2).toString(16));
     }
-    address = ipv6.join(':');
+    hostname = ipv6.join(':');
   } else {
     throw new Error(`unknow address family: ${af}`);
   }
@@ -64,112 +84,92 @@ const decodeRequestHeader = (header, uuid) => {
   return {
     version,
     port,
-    address,
+    hostname,
     byteOffset,
   };
 };
 
-const { log } = console;
-
-const tproxy = async ({
-  server, stream, version, socket,
-}) => {
-  stream.pipeTo(socket.writable);
-  let response;
-  await socket.readable.pipeTo(new WritableStream({
-    write: async (chunk) => {
-      if (!response) {
-        response = await new Blob([new Uint8Array([version, 0]), chunk]).arrayBuffer();
-      } else {
-        response = chunk;
-      }
-      server.send(response);
-    },
-  }));
-
-  socket.close();
-  socket.closed.catch(({ message }) => {
-    log(`outbound connection closed: ${message}`);
-  });
-
-  return response;
-};
-
-const process = (request, env) => {
-  log(`inbound connection from: ${request.headers.get('CF-connecting-IP')}`);
-
-  // eslint-disable-next-line no-undef
-  const [client, server] = new WebSocketPair();
-  server.accept();
-
-  // 0-RTT
-  const stream1 = new ReadableStream({
-    start: (controller) => {
-      const earlyData = request.headers.get('Sec-WebSocket-Protocol');
-      if (earlyData) {
-        controller.enqueue(base64toArrayBuffer(earlyData));
-      }
-
-      server.addEventListener('message', (event) => {
-        controller.enqueue(event.data);
-      });
-
-      server.addEventListener('close', (event) => {
-        if (!event.wasClean) {
-          log(`inbound connection closed: ${event.reason}`);
-        }
-        try {
-          controller.close();
-        } catch (e) {
-          log(e);
-        }
-      });
-    },
-  });
-
-  // get rid of header
-  const { promise, resolve, reject } = Promise.withResolvers();
-  let version;
-  let port;
-  let address;
-  const stream2 = new ReadableStream({
-    start: async (controller) => {
+const decodeVLESS = (vless, UUID) => new Promise((resolve, reject) => {
+  let isDecoded;
+  // need identity stream here to let Promise resolved
+  const identity = new TransformStream();
+  const body = identity.readable;
+  vless.pipeThrough(new TransformStream({
+    transform: (chunk, controller) => {
       try {
-        server.addEventListener('close', () => controller.close());
-        // eslint-disable-next-line no-restricted-syntax
-        for await (const chunk of stream1) {
-          let byteOffset = 0;
-          if (!port) {
-            ({
-              version, port, address, byteOffset,
-            } = decodeRequestHeader(chunk, env.UUID));
-            resolve();
-          }
+        if (!isDecoded) {
+          const {
+            version, port, hostname, byteOffset,
+          } = decodeVLESSHeader(chunk, UUID);
+
+          resolve({
+            version, port, hostname, body,
+          });
+
           controller.enqueue(chunk.slice(byteOffset));
+          isDecoded = true;
+        } else {
+          controller.enqueue(chunk);
         }
       } catch (e) {
         reject(e);
       }
     },
+  })).pipeTo(identity.writable);
+});
+
+const encodeResponse = (server, version, socket) => {
+  let isEncoded;
+  // avoid socket closed by reading
+  const [r1, r2] = socket.readable.tee();
+  r2.cancel();
+  return r1.pipeTo(new WritableStream({
+    write: (chunk) => {
+      if (server.readyState !== 1) return;
+      if (!isEncoded) {
+        isEncoded = true;
+        new Blob([new Uint8Array([version, 0]), chunk]).arrayBuffer()
+          .then(server.send.bind(server));
+      } else {
+        server.send(chunk);
+      }
+    },
+  })).then(() => isEncoded);
+};
+
+const processSocket = (server, version, body, hosts) => {
+  log(`outbound connection to ${hosts[0].hostname}:${hosts[0].port}`);
+  // backup for retry
+  const [bodyTeed, backup] = body.tee();
+  // close of writable is controlled by pipeTo, do not close by itself
+  const socket = connect(hosts[0], { allowHalfOpen: true });
+  let isEncoded;
+  // prevent internal error when connect failed
+  bodyTeed.pipeTo(socket.writable, { preventCancel: true });
+  encodeResponse(server, version, socket).then((value) => {
+    isEncoded = value;
+  }).finally(() => {
+    if (server.readyState === 1 && !isEncoded && hosts.length > 1) {
+      processSocket(server, version, backup, hosts.slice(1));
+    }
   });
-  const [teedOff1, teedOff2] = stream2.tee();
+  socket.closed.catch((reason) => log(`outbound connection closed: ${reason.message}`));
+};
 
-  promise.then(async () => {
-    log(`outbound connection to ${address}:${port}`);
-    const response = await tproxy({
-      server, stream: teedOff1, version, socket: connect({ hostname: address, port }),
-    });
-    if (response) return;
+const process = (request, env) => {
+  log(`inbound connection from: ${request.headers.get('CF-connecting-IP')}`);
+  // eslint-disable-next-line no-undef
+  const [client, server] = new WebSocketPair();
+  server.accept();
 
-    const [hostname, port1] = env.PROXY.split(':');
-    if (!hostname) return;
-    const port2 = port1 || 443;
-    log(`proxy connection to ${hostname}:${port2}`);
-    tproxy({
-      server, stream: teedOff2, version, socket: connect({ hostname, port: port2 }),
-    });
+  decodeVLESS(decode0RTT(request, server), env.UUID).then(({
+    version, port, hostname, body,
+  }) => {
+    const hosts = [{ hostname, port }];
+    const [proxyHostname, proxyPort = 443] = env.PROXY.split(':');
+    if (hostname) hosts.push({ hostname: proxyHostname, port: proxyPort });
+    processSocket(server, version, body, hosts);
   }).catch(log);
-
   return new Response(null, { status: 101, webSocket: client });
 };
 
